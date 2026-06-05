@@ -26,12 +26,19 @@ def train_one_epoch(model: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, grad_mask, targets) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    for data_iter_step, (samples, grad_mask, targets, is_abnormal) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         targets = targets.to(device, non_blocking=True)
         samples = samples.to(device, non_blocking=True)
         grad_mask = grad_mask.to(device, non_blocking=True)
+        is_abnormal = is_abnormal.to(device, non_blocking=True)
 
-        loss, _, _ = model(samples, grad_mask=grad_mask, targets=targets, mask_ratio=args.mask_ratio)
+        loss, _, _ = model(
+            samples,
+            grad_mask=grad_mask,
+            targets=targets,
+            mask_ratio=args.mask_ratio,
+            is_abnormal=is_abnormal,
+        )
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):

@@ -32,20 +32,26 @@ class AbnormalDatasetGradientsTest(torch.utils.data.Dataset):
             if len(list(glob.glob(os.path.join(data_path, "test/frames", f"*/*{ext}")))) > 0:
                 extension = ext
                 break
+        if extension is None:
+            raise FileNotFoundError(f"No test frames found in {os.path.join(data_path, 'test/frames')}")
         self.extension = extension
-        dirs = list(glob.glob(os.path.join(data_path, "test", "frames", "*")))
+        dirs = sorted(glob.glob(os.path.join(data_path, "test", "frames", "*")))
         for dir in dirs:
-            imgs_path = list(glob.glob(os.path.join(dir, f"*{extension}")))
-            imgs_path = sorted(imgs_path, key=lambda x: int(os.path.basename(x).split('.')[0]))
+            imgs_path = sorted(
+                glob.glob(os.path.join(dir, f"*{extension}")),
+                key=lambda x: int(os.path.basename(x).split('.')[0]),
+            )
             lbls = np.loadtxt(os.path.join(gt_path, f"{os.path.basename(dir)}.txt"))
 
             data += imgs_path
             labels += list(lbls)
 
             video_name = os.path.basename(dir)
-            gradients_path = list(glob.glob(os.path.join(data_path, "test", "gradients2", video_name, "*.png")))
-            gradients_path = sorted(gradients_path, key=lambda x: int(os.path.basename(x).split('.')[0]))
-            gradients += gradients_path
+            for img_path in imgs_path:
+                frame_name = os.path.basename(img_path)
+                gradients.append(
+                    os.path.join(data_path, "test", "gradients2", video_name, frame_name)
+                )
         return data, labels, gradients
 
     def __getitem__(self, index):
@@ -58,7 +64,7 @@ class AbnormalDatasetGradientsTest(torch.utils.data.Dataset):
             img = np.concatenate([previous_img, current_img, next_img], axis=-1)
 
         gradient = cv2.imread(self.gradients[index])
-        if img.shape[:2] != self.args.input_size[::-1]:
+        if img.shape[:2] != self.args.input_size:
             img = cv2.resize(img, self.args.input_size[::-1])
             current_img = cv2.resize(current_img, self.args.input_size[::-1])
             gradient = cv2.resize(gradient, self.args.input_size[::-1])

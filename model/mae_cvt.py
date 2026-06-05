@@ -13,17 +13,30 @@ class MaskedAutoencoderCvT(nn.Module):
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False,
                  use_only_masked_tokens_ab=False, abnormal_score_func='L1', masking_method="random_masking",
-                 grad_weighted_loss=True, student_depth=1):
+                 grad_weighted_loss=True, student_depth=1,
+                 ts_abnormal_strategy="all", ts_margin_lambda=0.1,
+                 ts_loss_type="mse", bw2_eps=1e-4, ts_bw2_alpha=0.3):
         super().__init__()
         # --------------------------------------------------------------------------
         # Abnormal specifics
         self.use_only_masked_tokens_ab = use_only_masked_tokens_ab
-        self.abnormal_score_func = abnormal_score_func[0]
-        self.abnormal_score_func_TS = abnormal_score_func[1]
+        if isinstance(abnormal_score_func, (list, tuple)) and len(abnormal_score_func) >= 2:
+            self.abnormal_score_func = abnormal_score_func[0]
+            self.abnormal_score_func_TS = abnormal_score_func[1]
+        elif isinstance(abnormal_score_func, str):
+            self.abnormal_score_func = abnormal_score_func
+            self.abnormal_score_func_TS = abnormal_score_func
+        else:
+            raise ValueError("abnormal_score_func must be a str or a sequence of at least 2 elements")
         # --------------------------------------------------------------------------
 
         self.masking = getattr(self, masking_method)
         self.grad_weighted_loss=grad_weighted_loss
+        self.ts_abnormal_strategy = ts_abnormal_strategy
+        self.ts_margin_lambda = ts_margin_lambda
+        self.ts_loss_type = ts_loss_type
+        self.bw2_eps = bw2_eps
+        self.ts_bw2_alpha = ts_bw2_alpha
 
         assert 0 < student_depth < decoder_depth
         self.student_depth = student_depth
@@ -298,14 +311,71 @@ class MaskedAutoencoderCvT(nn.Module):
             loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
 
-    def forward_loss_TS(self, preds_stud, preds_teacher, mask):
+    def _ts_patch_mse(self, preds_stud, preds_teacher, mask):
         loss = (preds_stud - preds_teacher) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        denom = mask.sum(dim=1).clamp(min=1)
+        return (loss * mask).sum(dim=1) / denom
+
+    def _bw2_diagonal(self, x, y):
+        """Diagonal Bures-Wasserstein^2 between two sets of patch vectors [M, D]."""
+        mu_x = x.mean(dim=0)
+        mu_y = y.mean(dim=0)
+        std_x = x.std(dim=0, unbiased=False).clamp(min=self.bw2_eps)
+        std_y = y.std(dim=0, unbiased=False).clamp(min=self.bw2_eps)
+        # Use mean (not sum) over D so scale is comparable to patch MSE.
+        mean_term = ((mu_x - mu_y) ** 2).mean()
+        cov_term = ((std_x - std_y) ** 2).mean()
+        return mean_term + cov_term
+
+    def _ts_bw2_per_sample(self, preds_stud, preds_teacher, mask):
+        batch_size = preds_stud.shape[0]
+        losses = []
+        for b in range(batch_size):
+            idx = mask[b].bool()
+            if idx.sum() == 0:
+                losses.append(preds_stud.new_zeros(()))
+                continue
+            z_s = preds_stud[b, idx]
+            z_t = preds_teacher[b, idx]
+            losses.append(self._bw2_diagonal(z_s, z_t))
+        return torch.stack(losses)
+
+    def _apply_asymmetric_ts_loss(self, per_sample, is_abnormal, preds_stud):
+        if is_abnormal is None or self.ts_abnormal_strategy == "all":
+            return per_sample.mean()
+
+        is_abnormal = is_abnormal.bool()
+        normal_mask = ~is_abnormal
+        loss = preds_stud.new_zeros(())
+
+        if normal_mask.any():
+            loss = loss + per_sample[normal_mask].mean()
+
+        if self.ts_abnormal_strategy == "margin" and is_abnormal.any():
+            loss = loss - self.ts_margin_lambda * per_sample[is_abnormal].mean()
+
+        if self.ts_abnormal_strategy == "skip" and not normal_mask.any():
+            return preds_stud.sum() * 0.0
 
         return loss
 
-    def forward(self, imgs, targets, grad_mask=None, mask_ratio=0.75):
+    def forward_loss_TS(self, preds_stud, preds_teacher, mask, is_abnormal=None):
+        per_sample_mse = self._ts_patch_mse(preds_stud, preds_teacher, mask)
+        if self.ts_loss_type == "mse":
+            per_sample = per_sample_mse
+        elif self.ts_loss_type == "bw2":
+            per_sample = self._ts_bw2_per_sample(preds_stud, preds_teacher, mask)
+        elif self.ts_loss_type == "bw2_mse":
+            alpha = self.ts_bw2_alpha
+            per_sample_bw2 = self._ts_bw2_per_sample(preds_stud, preds_teacher, mask)
+            per_sample = alpha * per_sample_bw2 + (1.0 - alpha) * per_sample_mse
+        else:
+            raise ValueError(f"Unknown ts_loss_type: {self.ts_loss_type}")
+
+        return self._apply_asymmetric_ts_loss(per_sample, is_abnormal, preds_stud)
+
+    def forward(self, imgs, targets, grad_mask=None, mask_ratio=0.75, is_abnormal=None):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, grad_mask)
 
         if self.train_TS is False:
@@ -317,7 +387,7 @@ class MaskedAutoencoderCvT(nn.Module):
                 return loss, pred, mask, self.abnormal_score(targets, pred, mask, grad_mask)
         else:
             pred_stud, pred_teacher = self.forward_decoder_TS(latent, ids_restore)  # [N, L, p*p*3]
-            loss = self.forward_loss_TS(pred_stud, pred_teacher, mask)
+            loss = self.forward_loss_TS(pred_stud, pred_teacher, mask, is_abnormal=is_abnormal)
             if self.training:
                 return loss, pred_stud, mask
             else:

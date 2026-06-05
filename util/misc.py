@@ -326,9 +326,34 @@ def save_model(args, epoch, model, optimizer, loss_scaler, latest=False, best=Fa
                 save_on_master(to_save, checkpoint_path)
 
 
+def load_teacher_checkpoint(args, model):
+    """Load a finished teacher checkpoint and start Stage-2 (student) training."""
+    checkpoint_path = args.teacher_checkpoint
+    if not checkpoint_path or not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
+    if missing:
+        print(f"Warning: missing keys when loading teacher: {len(missing)}")
+    if unexpected:
+        print(f"Warning: unexpected keys when loading teacher: {len(unexpected)}")
+
+    args.start_epoch = args.start_TS_epoch
+    print(
+        f"Loaded teacher weights from {checkpoint_path}; "
+        f"student training starts at epoch {args.start_epoch}/{args.epochs - 1}"
+    )
+    return checkpoint
+
+
 def load_model(args, model, optimizer=None, loss_scaler=None):
     if args.resume:
-        checkpoint = torch.load(os.path.join(args.output_dir, "checkpoint-latest.pth"), map_location='cpu')
+        checkpoint = torch.load(
+            os.path.join(args.output_dir, "checkpoint-latest.pth"),
+            map_location='cpu',
+            weights_only=False,
+        )
         model.load_state_dict(checkpoint['model'])
         print("Resume checkpoint %s" % args.resume)
         if optimizer:
