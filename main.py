@@ -57,6 +57,16 @@ def main(args):
         ts_loss_type=args.ts_loss_type,
         bw2_eps=args.bw2_eps,
         ts_bw2_alpha=args.ts_bw2_alpha,
+        ts_bw2_normalize=args.ts_bw2_normalize,
+        ts_bw2_rank=args.ts_bw2_rank,
+        ts_gram_lambda=args.ts_gram_lambda,
+        ts_gram_max_patches=args.ts_gram_max_patches,
+        use_cls_head=args.use_cls_head,
+        cls_loss_weight=args.cls_loss_weight,
+        use_paper_fusion=args.use_paper_fusion,
+        inf_alpha=args.inf_alpha,
+        inf_beta=args.inf_beta,
+        inf_gamma=args.inf_gamma,
     )
     if args.dataset == 'avenue':
         model = mae_cvt_patch16(**model_kwargs).float()
@@ -89,7 +99,10 @@ def do_training(args, data_loader_test, data_loader_train, device, log_writer, m
     print("actual lr: %.2e" % args.lr)
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.param_groups_weight_decay(model, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    if getattr(args, 'optimizer', 'adamw').lower() == 'adam':
+        optimizer = torch.optim.Adam(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    else:
+        optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
@@ -160,8 +173,8 @@ if __name__ == '__main__':
         '--ts_loss_type',
         type=str,
         default=None,
-        choices=['mse', 'bw2', 'bw2_mse'],
-        help='Stage-2 distillation loss: mse, bw2, or bw2_mse (alpha*BW2 + (1-alpha)*MSE)',
+        choices=['mse', 'bw2', 'bw2_mse', 'bw2_lowrank', 'bw2_lowrank_mse'],
+        help='Stage-2 distillation loss',
     )
     parser.add_argument('--ts_margin_lambda', type=float, default=None)
     parser.add_argument('--bw2_eps', type=float, default=None)
@@ -169,8 +182,41 @@ if __name__ == '__main__':
         '--ts_bw2_alpha',
         type=float,
         default=None,
-        help='Weight alpha on BW2 in hybrid loss (default 0.3). Final = alpha*BW2 + (1-alpha)*MSE',
+        help='Weight on BW2 in hybrid loss after optional normalization (default 0.5)',
     )
+    parser.add_argument(
+        '--ts_bw2_normalize',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Normalize MSE/BW2 to batch mean ~1 before hybrid mix (default: True)',
+    )
+    parser.add_argument('--ts_bw2_rank', type=int, default=None, help='Low-rank BW2 subspace dim')
+    parser.add_argument(
+        '--ts_gram_lambda',
+        type=float,
+        default=None,
+        help='Optional patch Gram alignment weight (0 disables)',
+    )
+    parser.add_argument('--ts_gram_max_patches', type=int, default=None)
+    parser.add_argument(
+        '--masking_method',
+        type=str,
+        default=None,
+        choices=['random_masking', 'grad_masking_v1'],
+    )
+    parser.add_argument(
+        '--use_cls_head',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Enable cls head (Stage-1 BCE on synthetic abnormal frames)',
+    )
+    parser.add_argument(
+        '--use_paper_fusion',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help='Use paper pixel-level score fusion (Eq.6, includes cls when enabled)',
+    )
+    parser.add_argument('--cls_loss_weight', type=float, default=None)
     parser.add_argument('--experiment_name', type=str, default=None)
     parser.add_argument('--run_type', type=str, default=None, choices=['train', 'inference'])
     parser.add_argument(
@@ -199,6 +245,22 @@ if __name__ == '__main__':
         args.bw2_eps = cli_args.bw2_eps
     if cli_args.ts_bw2_alpha is not None:
         args.ts_bw2_alpha = cli_args.ts_bw2_alpha
+    if cli_args.ts_bw2_normalize is not None:
+        args.ts_bw2_normalize = cli_args.ts_bw2_normalize
+    if cli_args.ts_bw2_rank is not None:
+        args.ts_bw2_rank = cli_args.ts_bw2_rank
+    if cli_args.ts_gram_lambda is not None:
+        args.ts_gram_lambda = cli_args.ts_gram_lambda
+    if cli_args.ts_gram_max_patches is not None:
+        args.ts_gram_max_patches = cli_args.ts_gram_max_patches
+    if cli_args.masking_method is not None:
+        args.masking_method = cli_args.masking_method
+    if cli_args.use_cls_head is not None:
+        args.use_cls_head = cli_args.use_cls_head
+    if cli_args.use_paper_fusion is not None:
+        args.use_paper_fusion = cli_args.use_paper_fusion
+    if cli_args.cls_loss_weight is not None:
+        args.cls_loss_weight = cli_args.cls_loss_weight
     if cli_args.student_only:
         args.student_only = True
     if cli_args.teacher_checkpoint is not None:
@@ -212,11 +274,18 @@ if __name__ == '__main__':
     if cli_args.experiment_name is not None:
         args.experiment_name = cli_args.experiment_name
     else:
-        if args.ts_loss_type == 'bw2_mse':
+        if args.ts_loss_type in ('bw2_mse', 'bw2_lowrank_mse'):
             alpha_tag = int(round(args.ts_bw2_alpha * 100))
-            loss_prefix = f'bw2mse_a{alpha_tag:02d}'
-        elif args.ts_loss_type == 'bw2':
-            loss_prefix = 'bw2'
+            norm_tag = 'norm' if args.ts_bw2_normalize else 'raw'
+            if args.ts_loss_type == 'bw2_lowrank_mse':
+                loss_prefix = f'bw2lr_r{args.ts_bw2_rank}_a{alpha_tag:02d}_{norm_tag}'
+            else:
+                loss_prefix = f'bw2mse_a{alpha_tag:02d}_{norm_tag}'
+            if args.ts_gram_lambda > 0:
+                gram_tag = int(round(args.ts_gram_lambda * 100))
+                loss_prefix = f'{loss_prefix}_g{gram_tag:02d}'
+        elif args.ts_loss_type in ('bw2', 'bw2_lowrank'):
+            loss_prefix = 'bw2lr' if args.ts_loss_type == 'bw2_lowrank' else 'bw2'
         else:
             loss_prefix = 'mse'
         strategy_to_name = {

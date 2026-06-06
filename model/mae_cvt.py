@@ -4,6 +4,12 @@ from einops import rearrange
 from torch import nn
 import torch.nn.functional as F
 from model.cvt import ConvEmbed, Block
+from util.bw2_loss import (
+    diagonal_bw2,
+    gram_patch_loss,
+    lowrank_bw2,
+    normalize_loss_terms,
+)
 from util.morphology import Erosion2d, Dilation2d
 
 
@@ -15,7 +21,11 @@ class MaskedAutoencoderCvT(nn.Module):
                  use_only_masked_tokens_ab=False, abnormal_score_func='L1', masking_method="random_masking",
                  grad_weighted_loss=True, student_depth=1,
                  ts_abnormal_strategy="all", ts_margin_lambda=0.1,
-                 ts_loss_type="mse", bw2_eps=1e-4, ts_bw2_alpha=0.3):
+                 ts_loss_type="mse", bw2_eps=1e-4, ts_bw2_alpha=0.3,
+                 ts_bw2_normalize=True, ts_bw2_rank=32, ts_gram_lambda=0.0,
+                 ts_gram_max_patches=128,
+                 use_cls_head=False, cls_loss_weight=1.0,
+                 use_paper_fusion=False, inf_alpha=0.4, inf_beta=0.3, inf_gamma=0.3):
         super().__init__()
         # --------------------------------------------------------------------------
         # Abnormal specifics
@@ -37,6 +47,16 @@ class MaskedAutoencoderCvT(nn.Module):
         self.ts_loss_type = ts_loss_type
         self.bw2_eps = bw2_eps
         self.ts_bw2_alpha = ts_bw2_alpha
+        self.ts_bw2_normalize = ts_bw2_normalize
+        self.ts_bw2_rank = ts_bw2_rank
+        self.ts_gram_lambda = ts_gram_lambda
+        self.ts_gram_max_patches = ts_gram_max_patches
+        self.use_cls_head = use_cls_head
+        self.cls_loss_weight = cls_loss_weight
+        self.use_paper_fusion = use_paper_fusion
+        self.inf_alpha = inf_alpha
+        self.inf_beta = inf_beta
+        self.inf_gamma = inf_gamma
 
         assert 0 < student_depth < decoder_depth
         self.student_depth = student_depth
@@ -62,6 +82,7 @@ class MaskedAutoencoderCvT(nn.Module):
             Block(embed_dim, embed_dim, num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
+        self.cls_head = nn.Linear(embed_dim, 1)
         # --------------------------------------------------------------------------
 
         # --------------------------------------------------------------------------
@@ -105,6 +126,8 @@ class MaskedAutoencoderCvT(nn.Module):
             param.requires_grad = False
         for param in self.decoder_pred.parameters():
             param.requires_grad = False
+        for param in self.cls_head.parameters():
+            param.requires_grad = False
         for i in range(0, len(self.decoder_blocks)):
             for param in self.decoder_blocks[i].parameters():
                 param.requires_grad = False
@@ -131,8 +154,8 @@ class MaskedAutoencoderCvT(nn.Module):
         imgs: (N, 3, H, W)
         """
         p = self.patch_embed.patch_size[0]
-        h = 20
-        w=40
+        h = self.H
+        w = self.W
         assert h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, self.out_chans))
@@ -317,29 +340,40 @@ class MaskedAutoencoderCvT(nn.Module):
         denom = mask.sum(dim=1).clamp(min=1)
         return (loss * mask).sum(dim=1) / denom
 
-    def _bw2_diagonal(self, x, y):
-        """Diagonal Bures-Wasserstein^2 between two sets of patch vectors [M, D]."""
-        mu_x = x.mean(dim=0)
-        mu_y = y.mean(dim=0)
-        std_x = x.std(dim=0, unbiased=False).clamp(min=self.bw2_eps)
-        std_y = y.std(dim=0, unbiased=False).clamp(min=self.bw2_eps)
-        # Use mean (not sum) over D so scale is comparable to patch MSE.
-        mean_term = ((mu_x - mu_y) ** 2).mean()
-        cov_term = ((std_x - std_y) ** 2).mean()
-        return mean_term + cov_term
+    def _bw2_on_patch_pair(self, z_s, z_t):
+        if self.ts_loss_type in ("bw2_lowrank", "bw2_lowrank_mse"):
+            return lowrank_bw2(z_s, z_t, rank=self.ts_bw2_rank, eps=self.bw2_eps)
+        return diagonal_bw2(z_s, z_t, eps=self.bw2_eps)
 
-    def _ts_bw2_per_sample(self, preds_stud, preds_teacher, mask):
+    def _ts_distill_per_sample(self, preds_stud, preds_teacher, mask):
         batch_size = preds_stud.shape[0]
-        losses = []
+        bw2_losses = []
+        gram_losses = []
         for b in range(batch_size):
             idx = mask[b].bool()
             if idx.sum() == 0:
-                losses.append(preds_stud.new_zeros(()))
+                bw2_losses.append(preds_stud.new_zeros(()))
+                gram_losses.append(preds_stud.new_zeros(()))
                 continue
             z_s = preds_stud[b, idx]
             z_t = preds_teacher[b, idx]
-            losses.append(self._bw2_diagonal(z_s, z_t))
-        return torch.stack(losses)
+            bw2_losses.append(self._bw2_on_patch_pair(z_s, z_t))
+            if self.ts_gram_lambda > 0.0:
+                gram_losses.append(
+                    gram_patch_loss(z_s, z_t, max_patches=self.ts_gram_max_patches)
+                )
+        bw2_out = torch.stack(bw2_losses)
+        if self.ts_gram_lambda > 0.0:
+            return bw2_out, torch.stack(gram_losses)
+        return bw2_out, None
+
+    def _combine_bw2_mse(self, per_sample_mse, per_sample_bw2):
+        alpha = self.ts_bw2_alpha
+        if self.ts_bw2_normalize:
+            per_sample_mse, per_sample_bw2 = normalize_loss_terms(
+                per_sample_mse, per_sample_bw2
+            )
+        return (1.0 - alpha) * per_sample_mse + alpha * per_sample_bw2
 
     def _apply_asymmetric_ts_loss(self, per_sample, is_abnormal, preds_stud):
         if is_abnormal is None or self.ts_abnormal_strategy == "all":
@@ -364,16 +398,48 @@ class MaskedAutoencoderCvT(nn.Module):
         per_sample_mse = self._ts_patch_mse(preds_stud, preds_teacher, mask)
         if self.ts_loss_type == "mse":
             per_sample = per_sample_mse
-        elif self.ts_loss_type == "bw2":
-            per_sample = self._ts_bw2_per_sample(preds_stud, preds_teacher, mask)
-        elif self.ts_loss_type == "bw2_mse":
-            alpha = self.ts_bw2_alpha
-            per_sample_bw2 = self._ts_bw2_per_sample(preds_stud, preds_teacher, mask)
-            per_sample = alpha * per_sample_bw2 + (1.0 - alpha) * per_sample_mse
+        elif self.ts_loss_type in ("bw2", "bw2_lowrank"):
+            per_sample_bw2, per_sample_gram = self._ts_distill_per_sample(
+                preds_stud, preds_teacher, mask
+            )
+            per_sample = per_sample_bw2
+            if per_sample_gram is not None:
+                per_sample = per_sample + self.ts_gram_lambda * per_sample_gram
+        elif self.ts_loss_type in ("bw2_mse", "bw2_lowrank_mse"):
+            per_sample_bw2, per_sample_gram = self._ts_distill_per_sample(
+                preds_stud, preds_teacher, mask
+            )
+            per_sample = self._combine_bw2_mse(per_sample_mse, per_sample_bw2)
+            if per_sample_gram is not None:
+                if self.ts_bw2_normalize:
+                    (per_sample_gram,) = normalize_loss_terms(per_sample_gram)
+                per_sample = per_sample + self.ts_gram_lambda * per_sample_gram
         else:
             raise ValueError(f"Unknown ts_loss_type: {self.ts_loss_type}")
 
         return self._apply_asymmetric_ts_loss(per_sample, is_abnormal, preds_stud)
+
+    def cls_logits(self, latent):
+        return self.cls_head(latent[:, 0]).squeeze(-1)
+
+    def cls_score(self, latent):
+        return torch.sigmoid(self.cls_logits(latent))
+
+    def fused_anomaly_score_TS(self, targets, pred_stud, pred_teacher, cls_score=None, score_channels=3):
+        """Paper Eq.(6): pixel-level fusion then spatial max for frame score."""
+        pred_teacher_img = self.unpatchify(pred_teacher)
+        pred_stud_img = self.unpatchify(pred_stud)
+        target_img = targets[:, :score_channels]
+        pred_teacher_img = pred_teacher_img[:, :score_channels]
+        pred_stud_img = pred_stud_img[:, :score_channels]
+
+        teacher_recon = ((target_img - pred_teacher_img) ** 2).mean(dim=1)
+        st_diff = ((pred_teacher_img - pred_stud_img) ** 2).mean(dim=1)
+        fused = self.inf_alpha * teacher_recon + self.inf_beta * st_diff
+        if self.use_cls_head and self.inf_gamma > 0 and cls_score is not None:
+            cls_map = cls_score.view(-1, 1, 1).expand_as(teacher_recon)
+            fused = fused + self.inf_gamma * cls_map
+        return fused.amax(dim=(1, 2))
 
     def forward(self, imgs, targets, grad_mask=None, mask_ratio=0.75, is_abnormal=None):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, grad_mask)
@@ -381,6 +447,11 @@ class MaskedAutoencoderCvT(nn.Module):
         if self.train_TS is False:
             pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
             loss = self.forward_loss(targets, grad_mask, pred, mask)
+            if self.training and self.use_cls_head and is_abnormal is not None:
+                cls_loss = F.binary_cross_entropy_with_logits(
+                    self.cls_logits(latent), is_abnormal.float()
+                )
+                loss = loss + self.cls_loss_weight * cls_loss
             if self.training:
                 return loss, pred, mask
             else:
@@ -391,7 +462,15 @@ class MaskedAutoencoderCvT(nn.Module):
             if self.training:
                 return loss, pred_stud, mask
             else:
-                return loss, pred_teacher, mask, self.abnormal_score_TS(targets, pred_stud, pred_teacher, mask, grad_mask)
+                if self.use_paper_fusion:
+                    cls_score = self.cls_score(latent) if self.use_cls_head else None
+                    score = self.fused_anomaly_score_TS(
+                        targets, pred_stud, pred_teacher, cls_score=cls_score
+                    )
+                    return loss, pred_teacher, mask, score
+                return loss, pred_teacher, mask, self.abnormal_score_TS(
+                    targets, pred_stud, pred_teacher, mask, grad_mask
+                )
 
     def abnormal_score(self, imgs, pred, mask, gradients):
         imgs = self.patchify(imgs)

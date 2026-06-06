@@ -8,6 +8,13 @@ from util.abnormal_utils import filt
 import sklearn.metrics as metrics
 
 
+def fuse_ts_teacher_scores(ts_score, teacher_score, args):
+    """Fuse student-teacher discrepancy and teacher reconstruction scores."""
+    w_teacher = float(getattr(args, "score_weight_teacher", 0.4))
+    w_ts = float(getattr(args, "score_weight_ts", 0.3))
+    return w_teacher * teacher_score + w_ts * ts_score
+
+
 def train_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int,
@@ -20,6 +27,8 @@ def train_one_epoch(model: torch.nn.Module,
     if epoch >= args.start_TS_epoch:
         model.train_TS = True
         model.freeze_backbone()
+    else:
+        model.train_TS = False
 
     optimizer.zero_grad()
 
@@ -59,7 +68,6 @@ def train_one_epoch(model: torch.nn.Module,
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
 
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -85,13 +93,15 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
         samples = samples.to(device)
         grads = grads.to(device)
         targets = targets.to(device)
-        _, _, _, recon_error = model(samples, grad_mask=grads,targets=targets, mask_ratio=args.mask_ratio)
+        model.train_TS = epoch >= args.start_TS_epoch
+        _, _, _, recon_error = model(
+            samples, grad_mask=grads, targets=targets, mask_ratio=args.mask_ratio
+        )
         if isinstance(recon_error, list):
-            recon_error = recon_error[0] + recon_error[1]
+            recon_error = fuse_ts_teacher_scores(recon_error[0], recon_error[1], args)
         recon_error = recon_error.detach().cpu().numpy()
         predictions += list(recon_error)
 
-    # Compute statistics
     predictions = np.array(predictions)
     labels = np.array(labels)
     videos = np.array(videos)
@@ -102,11 +112,20 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
     for vid in np.unique(videos):
         pred = predictions[np.array(videos) == vid]
         pred = np.nan_to_num(pred, nan=0.)
-        if args.dataset=='avenue':
-            pred = filt(pred, range=38, mu=11)
+        if args.dataset == 'avenue':
+            pred = filt(
+                pred,
+                range=getattr(args, "smooth_range", 38),
+                mu=getattr(args, "smooth_mu", 11),
+            )
+        elif args.dataset == 'shanghai':
+            pred = filt(
+                pred,
+                range=getattr(args, "smooth_range", 900),
+                mu=getattr(args, "smooth_mu", 282),
+            )
         else:
-            raise ValueError('Unknown parameters for predictions postprocessing')
-        # pred = (pred - np.min(pred)) / (np.max(pred) - np.min(pred))
+            raise ValueError(f'Unknown dataset for predictions postprocessing: {args.dataset}')
 
         filtered_preds.append(pred)
         lbl = labels[np.array(videos) == vid]
@@ -119,7 +138,6 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
 
     macro_auc = np.nanmean(aucs)
 
-    # Micro-AUC
     filtered_preds = np.concatenate(filtered_preds)
     filtered_labels = np.concatenate(filtered_labels)
 
@@ -127,6 +145,5 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
     micro_auc = metrics.auc(fpr, tpr)
     micro_auc = np.nan_to_num(micro_auc, nan=1.0)
 
-    # gather the stats from all processes
     print(f"MicroAUC: {micro_auc}, MacroAUC: {macro_auc}")
     return {"micro": micro_auc, "macro": macro_auc}

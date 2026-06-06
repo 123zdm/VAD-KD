@@ -9,13 +9,34 @@ def _build_output_dir(dataset, experiment_name):
     return os.path.join(_BASE_OUTPUT, dataset, experiment_name)
 
 
+def _baseline_defaults(config):
+    """Defaults aligned with official repo + successful local ablations."""
+    config.epochs = 140
+    config.start_TS_epoch = 100
+    config.masking_method = "random_masking"
+    config.optimizer = "adamw"
+    config.weight_decay = 0.05
+
+    # Paper Eq.(6): pixel-level fusion + optional cls branch.
+    config.use_cls_head = True
+    config.cls_loss_weight = 1.0
+    config.use_paper_fusion = True
+    config.score_weight_teacher = 0.4
+    config.score_weight_ts = 0.3
+    config.score_weight_cls = 0.3
+    config.inf_alpha = 0.4
+    config.inf_beta = 0.3
+    config.inf_gamma = 0.3
+
+    config.smooth_range = 38 if config.get("dataset", "avenue") == "avenue" else 900
+    config.smooth_mu = 11 if config.get("dataset", "avenue") == "avenue" else 282
+    config.smooth_normalize = config.get("dataset", "avenue") != "avenue"
+
+
 def get_configs_avenue():
     config = ml_collections.ConfigDict()
     config.batch_size = 100
-    config.epochs = 200
     config.mask_ratio = 0.5
-    config.start_TS_epoch = 100
-    config.masking_method = "random_masking"
     config.experiment_name = "mse_all"
     config.output_dir = _build_output_dir("avenue", config.experiment_name)
     config.abnormal_score_func = ['L2', 'L2']
@@ -28,22 +49,23 @@ def get_configs_avenue():
     config.resume = False
 
     # Stage-2 distillation
-    # ts_loss_type: "mse" | "bw2" | "bw2_mse" (alpha*BW2 + (1-alpha)*MSE)
-    # ts_abnormal_strategy: "all" | "skip" | "margin"
     config.ts_loss_type = "mse"
     config.ts_abnormal_strategy = "all"
     config.ts_margin_lambda = 0.1
     config.bw2_eps = 1e-4
-    config.ts_bw2_alpha = 0.3
+    config.ts_bw2_alpha = 0.5
+    config.ts_bw2_normalize = True
+    config.ts_bw2_rank = 32
+    config.ts_gram_lambda = 0.0
+    config.ts_gram_max_patches = 128
 
-    # Stage-2-only training (load teacher checkpoint, skip Stage 1)
     config.student_only = False
     config.teacher_checkpoint = ""
-    config.weight_decay = 0.05
     config.lr = 1e-4
 
-    # Dataset parameters
     config.dataset = "avenue"
+    _baseline_defaults(config)
+
     config.avenue_path = "/root/autodl-tmp/users/zhang-dong-mei/zhangdongmei/hstforu-kd/data/avenue"
     config.avenue_gt_path = "/root/autodl-tmp/users/zhang-dong-mei/zhangdongmei/hstforu-kd/data/avenue/Avenue_gt"
     config.percent_abnormal = 0.25
@@ -61,10 +83,7 @@ def get_configs_avenue():
 def get_configs_shanghai():
     config = ml_collections.ConfigDict()
     config.batch_size = 100
-    config.epochs = 200
     config.mask_ratio = 0.5
-    config.start_TS_epoch = 100
-    config.masking_method = "random_masking"
     config.experiment_name = "mse_all"
     config.output_dir = _build_output_dir("shanghai", config.experiment_name)
     config.abnormal_score_func = 'L1'
@@ -80,16 +99,19 @@ def get_configs_shanghai():
     config.ts_abnormal_strategy = "all"
     config.ts_margin_lambda = 0.1
     config.bw2_eps = 1e-4
-    config.ts_bw2_alpha = 0.3
+    config.ts_bw2_alpha = 0.5
+    config.ts_bw2_normalize = True
+    config.ts_bw2_rank = 32
+    config.ts_gram_lambda = 0.0
+    config.ts_gram_max_patches = 128
 
-    # Stage-2-only training (load teacher checkpoint, skip Stage 1)
     config.student_only = False
     config.teacher_checkpoint = ""
-    config.weight_decay = 0.05
     config.lr = 1e-4
 
-    # Dataset parameters
     config.dataset = "shanghai"
+    _baseline_defaults(config)
+
     config.shanghai_path = "/root/autodl-tmp/users/zhang-dong-mei/zhangdongmei/hstforu-kd/data/shanghaitech"
     config.shanghai_gt_path = "/root/autodl-tmp/users/zhang-dong-mei/zhangdongmei/hstforu-kd/data/shanghaitech/Shanghai_gt"
     config.percent_abnormal = 0.25

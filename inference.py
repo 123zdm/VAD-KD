@@ -8,9 +8,15 @@ from util import misc
 from util.abnormal_utils import filt
 
 
+def fuse_ts_teacher_scores(ts_score, teacher_score, args):
+    w_teacher = float(getattr(args, "score_weight_teacher", 0.4))
+    w_ts = float(getattr(args, "score_weight_ts", 0.3))
+    return w_teacher * teacher_score + w_ts * ts_score
+
+
 def inference(model: torch.nn.Module, data_loader: Iterable,
-                   device: torch.device,
-                   log_writer=None, args=None):
+              device: torch.device,
+              log_writer=None, args=None):
     model.eval()
     metric_logger = misc.MetricLogger(delimiter="  ")
     header = 'Testing '
@@ -18,44 +24,53 @@ def inference(model: torch.nn.Module, data_loader: Iterable,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    predictions_teacher = []
     predictions_student_teacher = []
+    predictions_teacher = []
     labels = []
     videos = []
     frames = []
-    for data_iter_step, (samples, grads, targets, label, vid, frame_name) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    for data_iter_step, (samples, grads, targets, label, vid, frame_name) in enumerate(
+        metric_logger.log_every(data_loader, args.print_freq, header)
+    ):
         videos += list(vid)
         labels += list(label.detach().cpu().numpy())
         frames += list(frame_name)
         samples = samples.to(device)
         grads = grads.to(device)
         targets = targets.to(device)
-        model.train_TS = True # student-teacher reconstruction error
+        model.train_TS = True
         if args.dataset == 'avenue':
             model.abnormal_score_func_TS = "L2"
         else:
             model.abnormal_score_func_TS = 'L1'
-        _, _, _, recon_error_st_tc = model(samples, targets=targets, grad_mask=grads, mask_ratio=args.mask_ratio)
-        recon_error_st_tc[0] = recon_error_st_tc[0].detach().cpu().numpy()
-        recon_error_st_tc[1] = recon_error_st_tc[1].detach().cpu().numpy()
-        predictions_student_teacher += list(recon_error_st_tc[0])
-        predictions_teacher += list(recon_error_st_tc[1])
+        _, _, _, recon_error = model(
+            samples, targets=targets, grad_mask=grads, mask_ratio=args.mask_ratio
+        )
+        if isinstance(recon_error, (list, tuple)):
+            predictions_student_teacher += list(recon_error[0].detach().cpu().numpy())
+            predictions_teacher += list(recon_error[1].detach().cpu().numpy())
+        else:
+            frame_scores = recon_error.detach().cpu().numpy()
+            predictions_student_teacher += list(frame_scores)
+            predictions_teacher += list(np.zeros_like(frame_scores))
 
-    # Compute statistics
-    predictions_teacher = np.array(predictions_teacher)
     predictions_student_teacher = np.array(predictions_student_teacher)
-    predictions = predictions_teacher+predictions_student_teacher
+    predictions_teacher = np.array(predictions_teacher)
+    if getattr(args, "use_paper_fusion", False):
+        predictions = predictions_student_teacher
+    else:
+        predictions = fuse_ts_teacher_scores(predictions_student_teacher, predictions_teacher, args)
     labels = np.array(labels)
     videos = np.array(videos)
 
-    if args.dataset =='avenue':
-        evaluate_model(predictions, labels, videos,
-                                           normalize_scores=False,
-                                           range=38, mu=11)
-    else:
-        evaluate_model(predictions_teacher, labels, videos,
-                       normalize_scores=True,
-                       range=900, mu=282)
+    return evaluate_model(
+        predictions,
+        labels,
+        videos,
+        normalize_scores=getattr(args, "smooth_normalize", False),
+        range=getattr(args, "smooth_range", 38 if args.dataset == "avenue" else 900),
+        mu=getattr(args, "smooth_mu", 11 if args.dataset == "avenue" else 282),
+    )
 
 
 def evaluate_model(predictions, labels, videos,
@@ -83,7 +98,6 @@ def evaluate_model(predictions, labels, videos,
 
     macro_auc = np.nanmean(aucs)
 
-    # Micro-AUC
     filtered_preds = np.concatenate(filtered_preds)
     filtered_labels = np.concatenate(filtered_labels)
 
@@ -91,6 +105,8 @@ def evaluate_model(predictions, labels, videos,
     micro_auc = metrics.auc(fpr, tpr)
     micro_auc = np.nan_to_num(micro_auc, nan=1.0)
 
-    # gather the stats from all processes
-    print(f"MicroAUC: {micro_auc}, MacroAUC: {macro_auc}, range:{range}, mu:{mu}, normalize scores:{normalize_scores}")
+    print(
+        f"MicroAUC: {micro_auc}, MacroAUC: {macro_auc}, "
+        f"range:{range}, mu:{mu}, normalize scores:{normalize_scores}"
+    )
     return micro_auc, macro_auc
