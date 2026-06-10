@@ -5,6 +5,7 @@ import util.misc as misc
 from typing import Iterable
 import numpy as np
 from util.abnormal_utils import filt
+from util.score_postprocess import apply_temporal_peak_pooling
 import sklearn.metrics as metrics
 
 
@@ -93,11 +94,18 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
         samples = samples.to(device)
         grads = grads.to(device)
         targets = targets.to(device)
-        model.train_TS = epoch >= args.start_TS_epoch
+        if getattr(args, "student_infer_only", False):
+            model.student_infer_only = True
+            model.train_TS = False
+        else:
+            model.student_infer_only = False
+            model.train_TS = epoch >= args.start_TS_epoch
         _, _, _, recon_error = model(
             samples, grad_mask=grads, targets=targets, mask_ratio=args.mask_ratio
         )
-        if isinstance(recon_error, list):
+        if getattr(args, "student_infer_only", False):
+            pass
+        elif isinstance(recon_error, list):
             recon_error = fuse_ts_teacher_scores(recon_error[0], recon_error[1], args)
         recon_error = recon_error.detach().cpu().numpy()
         predictions += list(recon_error)
@@ -112,6 +120,8 @@ def test_one_epoch(model: torch.nn.Module, data_loader: Iterable,
     for vid in np.unique(videos):
         pred = predictions[np.array(videos) == vid]
         pred = np.nan_to_num(pred, nan=0.)
+        peak_win = int(getattr(args, "temporal_peak_window", 1) or 1)
+        pred = apply_temporal_peak_pooling(pred, peak_win)
         if args.dataset == 'avenue':
             pred = filt(
                 pred,

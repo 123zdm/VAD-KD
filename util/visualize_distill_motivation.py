@@ -78,17 +78,9 @@ def build_model(args):
         abnormal_score_func=args.abnormal_score_func,
         masking_method=args.masking_method,
         grad_weighted_loss=args.grad_weighted_rec_loss,
-        ts_abnormal_strategy=args.ts_abnormal_strategy,
-        ts_margin_lambda=args.ts_margin_lambda,
         ts_loss_type=args.ts_loss_type,
         bw2_eps=args.bw2_eps,
         ts_bw2_alpha=args.ts_bw2_alpha,
-        use_cls_head=args.use_cls_head,
-        cls_loss_weight=args.cls_loss_weight,
-        use_paper_fusion=args.use_paper_fusion,
-        inf_alpha=args.inf_alpha,
-        inf_beta=args.inf_beta,
-        inf_gamma=args.inf_gamma,
     )
     if args.dataset == "avenue":
         return mae_cvt_patch16(**kwargs).float()

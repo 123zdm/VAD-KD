@@ -21,7 +21,6 @@ CMD=(
   "${PYTHON}" main.py
   --dataset "${DATASET}"
   --ts_loss_type "${LOSS}"
-  --ts_abnormal_strategy all
   --experiment_name "${EXP_NAME}"
   --run_type "${RUN_TYPE}"
 )
